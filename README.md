@@ -50,6 +50,9 @@ Arranqué la VM con el ISO montado y seguí el instalador (que se maneja solo co
      - Subnet: `192.168.56.0/24`
      - Address: `192.168.56.10`
      - Gateway y DNS: vacíos (la salida a internet va por la NAT)
+    
+![Configuracion de red del instalador](img/01-red-interna.png)
+
 4. **Proxy y mirror:** valores por defecto.
 5. **Almacenamiento:** "Use an entire disk" con las opciones por defecto (ver el problema que esto causó más adelante).
 6. **Profile setup:** nombre del servidor `wazuh-server`, usuario y contraseña (simple y sin caracteres especiales, porque el teclado del instalador puede tener otra distribución).
