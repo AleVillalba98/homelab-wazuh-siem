@@ -51,7 +51,7 @@ Arranqué la VM con el ISO montado y seguí el instalador (que se maneja solo co
      - Address: `192.168.56.10`
      - Gateway y DNS: vacíos (la salida a internet va por la NAT)
     
-![Configuracion de red del instalador](img/01-red-interna.png)
+![Configuracion de red del instalador](01-red-interna.png)
 
 4. **Proxy y mirror:** valores por defecto.
 5. **Almacenamiento:** "Use an entire disk" con las opciones por defecto (ver el problema que esto causó más adelante).
@@ -62,6 +62,8 @@ Arranqué la VM con el ISO montado y seguí el instalador (que se maneja solo co
 10. Al terminar, *Reboot now*. Apareció `[FAILED] Failed unmounting /cdrom`, que es normal en VirtualBox: se aprieta Enter y la VM reinicia.
 
 **Verificación:** ya iniciada la sesión, `ip a` mostró `192.168.56.10` en `enp0s3` y `10.0.3.15` en `enp0s8`. `ping -c 3 google.com` respondió con 0% de pérdida.
+
+![Verificación de las IP con ip a](01-verificacion-red-interna.png)
 
 ---
 
@@ -115,6 +117,8 @@ Al revisar el log (`/var/log/wazuh-install.log`) se vio que el instalador había
 
 **1. Primer indicio:** el único error marcado era `ERROR: Wazuh dashboard installation failed`. El `failed` del manager era una consecuencia de la limpieza automática, no la causa.
 
+![Error de disco lleno en el log](03-error-disco-lleno.png)
+
 **2. Descartar hipótesis:**
 - *Falta de RAM:* `sudo dmesg | grep -i -E "out of memory|killed process"` no devolvió nada, o sea el sistema no mató procesos.
 - *Descarga cortada:* el log mostraba que el paquete del dashboard (196 MB) se había descargado completo.
@@ -164,6 +168,8 @@ ls /var/ossec
 
 Lo que reveló `lsblk` y `vgdisplay`:
 
+![lsblk y vgdisplay con el volumen de 24 GB](02-lsblk-volumen-24gb.png)
+
 ```
 sda      50G  disk
 └─sda3   48G  part
@@ -184,6 +190,8 @@ df -h /
 ```
 
 El `df` pasó a mostrar unos 48 GB.
+
+![df -h después del lvextend](04-lvextend-resultado.png)
 
 **2. Limpiar restos y comprobar que no quedaran paquetes a medias:**
 
