@@ -226,31 +226,122 @@ Al final de la instalación apareció en consola un aviso del kernel (`e1000 ...
 | VirtualBox marcaba error en *Instalación desatendida* | Campos de contraseña vacíos | Marcar *Omitir instalación desatendida* para usar el instalador manual |
 | `wazuh-install.sh: No such file or directory` | `curl` imprimió el script en pantalla en vez de guardarlo (se usó `-0` con cero en lugar de `-O`) | Usar `curl -o wazuh-install.sh <URL>` (o minúscula explícita) y verificar con `ls -la` |
 | `grep` no devolvía la contraseña | Faltaba un espacio en el patrón de búsqueda | Buscar solo `indexer_username` |
+| "Wazuh dashboard server is not ready yet" | El dashboard todavía está arrancando o espera al indexer | Esperar uno o dos minutos y verificar que los cuatro servicios estén `active` |
+| El cambio de contraseña falla con "must have a length between 8 and 64..." | La clave no incluía un símbolo permitido (`.` `*` `+` `?` `-`) | Usar una clave con alguno de esos símbolos |
+| El dashboard devuelve error 500 o `Authentication Exception` tras cambiar la clave | Se cargó la clave de `admin` donde el dashboard espera la de `kibanaserver`, o hay una sesión vieja en el navegador | Restaurar la clave de `kibanaserver` en el keystore y probar en ventana de incógnito |
 
 ---
 
-## 8. Estado actual y próximos pasos
+## 8. Acceder al dashboard y cambiar la contraseña de `admin`
+
+### Acceso desde mi PC
+
+La VM usa una red interna aislada, así que mi PC real no la ve directamente. Para abrir el dashboard en el navegador usé un **reenvío de puertos** en el adaptador NAT de VirtualBox (*Configuración > Red > Adaptador 2 > Avanzadas > Reenvío de puertos*):
+
+| Protocolo | IP anfitrión | Puerto anfitrión | IP invitado | Puerto invitado |
+|---|---|---|---|---|
+| TCP | 127.0.0.1 | 8443 | 10.0.3.15 | 443 |
+
+Con eso el panel queda en `https://127.0.0.1:8443`. El certificado es autofirmado, así que el navegador muestra una advertencia que hay que aceptar (normal en un lab).
+
+Antes de entrar verifiqué que los cuatro servicios corrían:
+
+```bash
+sudo systemctl is-active wazuh-manager wazuh-indexer wazuh-dashboard filebeat
+```
+
+Justo después de encender la VM, el indexer aparece como `activating` durante uno o dos minutos (es el componente más pesado). Hay que esperar a que pase a `active`; mientras tanto el dashboard puede mostrar *"Wazuh dashboard server is not ready yet"*.
+
+![Dashboard de Wazuh funcionando, sin agentes registrados todavía](05-dashboard-wazuh.png)
+
+Todavía no hay agentes registrados, así que el panel está vacío. Es lo esperado en este punto.
+
+### Cambiar la contraseña de `admin`
+
+La contraseña que genera el instalador es larga y difícil de recordar, así que la cambié con la herramienta oficial de Wazuh:
+
+```bash
+curl -o wazuh-passwords-tool.sh https://packages.wazuh.com/4.14/wazuh-passwords-tool.sh
+sudo bash wazuh-passwords-tool.sh -u admin -p 'NuevaClave'
+```
+
+**Primer problema: la clave no cumplía los requisitos.** La herramienta devolvió:
+
+```
+ERROR: The password must have a length between 8 and 64 characters and contain
+at least one upper and lower case letter, a number and a symbol(.*+?-).
+```
+
+Los símbolos aceptados son solo `.` `*` `+` `?` `-`. Cualquier otro (`!`, `@`, `_`) no cuenta. No cambió nada: la clave anterior siguió funcionando. Con una clave que cumplía las reglas, el cambio se aplicó. Lo verifiqué contra el indexer:
+
+```bash
+curl -k -u admin:'NuevaClave' https://localhost:9200
+```
+
+La respuesta incluyó `cluster_name`, así que el indexer aceptaba la clave nueva.
+
+### El dashboard dejó de funcionar y cómo lo resolví
+
+Después del cambio, el dashboard respondió con:
+
+```
+{"statusCode":500,"error":"Error interno del servidor", ...}
+```
+
+Mi hipótesis fue que el dashboard seguía usando la clave vieja, y cargué la clave nueva de `admin` en su keystore. **Eso fue un error mío.** El dashboard no se conecta al indexer con `admin` sino con el usuario interno **`kibanaserver`**, que tiene su propia contraseña. Al reemplazarla por la de `admin`, el dashboard empezó a fallar con un `Response Error` repetido cada pocos segundos en su log:
+
+```bash
+sudo journalctl -u wazuh-dashboard --no-pager | tail -n 20
+```
+
+No pude confirmar con certeza el origen del primer error 500, porque el log solo mostraba un mensaje genérico. Lo que sí quedó claro es la configuración correcta:
+
+| Componente | Usuario con el que se conecta al indexer | Qué hay que actualizar al cambiar la clave de `admin` |
+|---|---|---|
+| Dashboard | `kibanaserver` | Nada. Hay que dejar su contraseña original en el keystore |
+| Filebeat | `admin` | Sí: `echo 'NuevaClave' \| sudo filebeat keystore add password --stdin --force` |
+
+Para devolverle al dashboard la contraseña de `kibanaserver`, que el instalador dejó en `wazuh-install-files.tar`, la leí a una variable sin mostrarla en pantalla, comprobé que funcionaba y actualicé el keystore:
+
+```bash
+KP=$(sudo tar -O -xf wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt \
+  | grep -A1 "indexer_username: 'kibanaserver'" | grep indexer_password | cut -d"'" -f2)
+curl -k -u kibanaserver:"$KP" https://localhost:9200
+echo "$KP" | sudo /usr/share/wazuh-dashboard/bin/opensearch-dashboards-keystore --allow-root add -f --stdin opensearch.password
+unset KP
+sudo systemctl restart wazuh-dashboard
+```
+
+Después del reinicio apareció otro error en el log, `Authentication Exception`. Esta vez era una **sesión vieja guardada en el navegador**, de antes del cambio de contraseña. En una ventana de incógnito pude iniciar sesión con `admin` y la clave nueva sin problemas. Borrar las cookies de `127.0.0.1` lo resuelve en el navegador habitual.
+
+> **Seguridad:** las contraseñas no van en capturas ni en el repositorio. Al compartir comandos en capturas conviene reemplazar la clave por un texto como `NuevaClave`.
+
+---
+
+## 9. Estado actual y próximos pasos
 
 **Hecho:**
 - VM `wazuh-server` con red interna y NAT configuradas
 - Ubuntu Server 24.04.5 instalado, con IP fija 192.168.56.10
-- Wazuh instalado correctamente (mensaje *Installation finished*)
+- Wazuh instalado correctamente y los cuatro servicios en `active`
+- Dashboard accesible desde mi PC por reenvío de puertos
+- Contraseña de `admin` cambiada y verificada
 
 **Pendiente:**
-1. Verificar los servicios con `systemctl is-active wazuh-manager wazuh-indexer wazuh-dashboard filebeat` (deben salir cuatro `active`).
-2. Agregar reglas de reenvío de puertos en el adaptador NAT para acceder desde el host:
-   - `127.0.0.1:8443` → `10.0.3.15:443` (dashboard)
-   - `127.0.0.1:2222` → `10.0.3.15:22` (SSH, para poder copiar y pegar comandos)
-3. Entrar al dashboard en `https://127.0.0.1:8443` (el certificado es autofirmado, hay que aceptar la advertencia).
-4. Crear la VM de Windows y conectarle el agente de Wazuh.
-5. Simular ataques desde Kali y documentar qué alertas genera cada uno.
+1. Crear la VM de Windows y conectarla a la red interna (IP `192.168.56.20`).
+2. Instalar el agente de Wazuh en Windows apuntando a `192.168.56.10` y verificar que figure como *Active*.
+3. Sumar la VM de Kali y simular ataques en mi propio lab.
+4. Documentar qué alertas genera cada ataque y cómo se vería en un SOC.
 
 ---
 
-## 9. Lecciones aprendidas
+## 10. Lecciones aprendidas
 
-- **Medir en el momento del error, no después.** El `df` que mostraba espacio libre se había tomado tras la limpieza automática y llevó a descartar la causa real durante un buen rato.
+- **Medir en el momento del error, no después.** El `df` que mostraba espacio libre se había tomado tras la limpieza automática del instalador y llevó a descartar la causa real durante un buen rato.
 - **Registrar toda la salida de comandos largos** (`-v` y `tee`). Cuando un instalador se deshace solo, el mensaje que explica el fallo puede no estar en el log principal.
 - **El instalador guiado de Ubuntu no siempre usa todo el disco.** Conviene revisar con `lsblk` y `vgdisplay` y extender el volumen antes de instalar software pesado.
 - **Los códigos de salida dicen mucho:** el 127 señalaba un archivo faltante, no un fallo del servicio.
-- **Un snapshot antes de instalar** ahorra tiempo cuando algo sale mal.
+- **Un snapshot antes de cada cambio grande** ahorra tiempo cuando algo sale mal.
+- **Cada componente usa su propio usuario.** El dashboard se conecta como `kibanaserver` y filebeat como `admin`. Cambiar la clave de uno no obliga a cambiar la del otro, y mezclarlas rompe el panel.
+- **Leer el mensaje de error completo antes de reintentar:** la herramienta de contraseñas decía exactamente qué símbolos aceptaba.
+- **Después de cambiar una contraseña, probar en una ventana de incógnito.** Una sesión vieja en el navegador puede dar errores de autenticación que parecen un problema del servidor.
