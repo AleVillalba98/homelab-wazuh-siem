@@ -318,24 +318,129 @@ Después del reinicio apareció otro error en el log, `Authentication Exception`
 
 ---
 
-## 9. Estado actual y próximos pasos
+## 9. Conectar el agente de Windows
+
+### La VM `win11-lab`
+
+| Elemento | Detalle |
+|---|---|
+| Sistema | Windows 11 Home x64 (ISO oficial de Microsoft, español) |
+| Recursos | 4 GB de RAM, 2 núcleos, disco de 64 GB (asignación dinámica) |
+| Red | Adaptador 1: red interna `lab-seguridad` con IP fija `192.168.56.20`. Adaptador 2: NAT para descargar el agente |
+| Instalación | Instalación desatendida de VirtualBox (resuelve solos los requisitos de TPM y Secure Boot) |
+
+Dos tropiezos antes de arrancar:
+
+- **Descargué por error la ISO para Arm64.** La página de Microsoft decía *"Windows 11 para PC basados en Arm"*. Mi PC es Intel/AMD, así que hay que bajar la imagen **x64** (tercera opción de la página de descarga). Una ISO de otra arquitectura no arranca en VirtualBox.
+- **La VM falló al iniciar** con *"no se hallaron un sistema operativo o un orden de arranque mal configurado"*. El ISO no estaba montado en la unidad óptica. Se resolvió montándolo y apretando una tecla cuando aparece *"Press any key to boot from CD or DVD"*.
+
+VirtualBox solo ofreció la edición **Home**. Alcanza para el lab, con una limitación a tener en cuenta: Windows 11 Home no acepta conexiones de Escritorio Remoto entrantes, así que no sirve para simular ataques contra RDP.
+
+### Verificar la conexión con el servidor
+
+Tras fijar la IP en el adaptador de la red interna, comprobé que la VM llega al servidor Wazuh, incluido el puerto de registro de agentes (1515):
+
+```powershell
+ping 192.168.56.10
+Test-NetConnection 192.168.56.10 -Port 1515
+```
+
+El `ping` respondió sin pérdidas y `TcpTestSucceeded` dio `True`.
+
+### Instalar el agente
+
+Abrí el dashboard desde un navegador **dentro de la VM de Windows** (`https://192.168.56.10`), fui a *Agents > Deploy new agent*, elegí Windows e indiqué `192.168.56.10` como dirección del servidor y `win11-lab` como nombre. El asistente genera un comando de PowerShell que descarga el instalador y lo instala:
+
+```powershell
+Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.14.8-1.msi -OutFile $env:tmp\wazuh-agent
+msiexec.exe /i $env:tmp\wazuh-agent /q WAZUH_MANAGER='192.168.56.10' WAZUH_AGENT_NAME='win11-lab'
+NET START Wazuh
+```
+
+**Detalle:** el agente apareció en el dashboard como **Pendiente** y recién pasó a **Activo** cuando inicié el servicio con `NET START Wazuh`. "Pendiente" significa que el servidor ya conoce al agente pero todavía no recibió su primera conexión.
+
+![Agente win11-lab en estado Activo](06-agente-activo.png)
+
+---
+
+## 10. Primera detección: actividad de prueba en Windows
+
+Para validar que el SIEM detecta actividad, generé eventos en mi propia VM con una PowerShell como administrador:
+
+```powershell
+# 1) Inicios de sesión fallidos (repetido 5 veces)
+runas /user:usuarioinexistente cmd
+
+# 2) Crear un usuario, agregarlo al grupo de administradores y borrarlo
+net user labtest ClaveDePrueba-1 /add
+net localgroup Administradores labtest /add
+net user labtest /delete
+```
+
+En un Windows en español el grupo se llama **Administradores**. Con el nombre en inglés (`administrators`) el comando falla con el error de sistema 1376 (*"El grupo local especificado no existe"*), y no se genera el evento que se busca.
+
+### Qué detectó Wazuh
+
+En *Threat Hunting > Eventos*, filtrando por el agente `win11-lab`:
+
+| Regla | Descripción | Nivel | Eventos |
+|---|---|---|---|
+| 60122 | Error de inicio de sesión: usuario desconocido o contraseña incorrecta | 5 | 5 (uno por cada intento) |
+| 60109 | Cuenta de usuario habilitada o creada | 8 | 4 |
+| 60111 | Cuenta de usuario desactivada o eliminada | 8 | 2 |
+| 60154 | El grupo de administradores cambió | **12** | 2 |
+
+Repetí la prueba de crear y borrar la cuenta, por eso algunas reglas aparecen duplicadas. Cada usuario nuevo también generó alertas de cambio de grupo de nivel 5 (reglas 60160 y 60170), probablemente porque Windows agrega las cuentas nuevas a un grupo por defecto.
+
+![Eventos filtrados por las reglas 60122, 60109 y 60111](07-eventos-reglas.png)
+
+![Alerta de nivel 12: el grupo de administradores cambió](08-alerta-nivel-12.png)
+
+### Relación con MITRE ATT&CK
+
+La vista *MITRE ATT&CK* del dashboard asocia estas reglas con técnicas del framework:
+
+| Regla | Técnica | Táctica |
+|---|---|---|
+| 60122 (inicio de sesión fallido) | T1531 | Impacto |
+| 60109 (cuenta creada) | T1098 | Persistencia |
+| 60111 (cuenta eliminada) | T1098 y T1531 | Persistencia e Impacto |
+
+![Eventos con su técnica y táctica MITRE](09-mitre-eventos.png)
+
+![Panel MITRE ATT&CK con las tácticas detectadas](10-mitre-panel.png)
+
+### Lo que observé
+
+- **Wazuh prioriza los cambios de privilegios.** Cinco inicios de sesión fallidos quedan en nivel 5, y la cuenta nueva sube a 8, pero **la única alerta de nivel 12 es el cambio en el grupo de administradores**.
+- **Cinco intentos fallidos no disparan alertas de correlación.** Las reglas que agrupan muchos fallos en poco tiempo necesitan más intentos; queda como prueba pendiente.
+- **Las asociaciones MITRE son las que trae cada regla y hay que interpretarlas con criterio.** Wazuh vincula los inicios de sesión fallidos con T1531 (*Account Access Removal*), mientras que para intentos repetidos de adivinar una contraseña lo habitual es pensar en *Brute Force* (T1110).
+- **No todo el ruido es mío.** Del total de eventos del agente, una parte es actividad normal de Windows y de la evaluación de configuración (CIS) que corre al conectarse, y se filtra por regla para aislar la prueba.
+
+### Alcance y límites
+
+Es actividad administrativa legítima generada a propósito en mi propia VM, no un ataque real. Lo que valida es la cadena completa (agente, servidor, alerta, vista MITRE) y no la capacidad de detectar a un adversario. El lab tiene un único endpoint Windows.
+
+---
+
+## 11. Estado actual y próximos pasos
 
 **Hecho:**
 - VM `wazuh-server` con red interna y NAT configuradas
 - Ubuntu Server 24.04.5 instalado, con IP fija 192.168.56.10
 - Wazuh instalado correctamente y los cuatro servicios en `active`
-- Dashboard accesible desde mi PC por reenvío de puertos
-- Contraseña de `admin` cambiada y verificada
+- Dashboard accesible desde mi PC por reenvío de puertos y contraseña de `admin` cambiada
+- VM `win11-lab` conectada a la red interna, con el agente de Wazuh en estado Activo
+- Primera detección: inicios de sesión fallidos, creación y eliminación de cuenta, y cambio en el grupo de administradores, con su correlación en MITRE ATT&CK
 
 **Pendiente:**
-1. Crear la VM de Windows y conectarla a la red interna (IP `192.168.56.20`).
-2. Instalar el agente de Wazuh en Windows apuntando a `192.168.56.10` y verificar que figure como *Active*.
-3. Sumar la VM de Kali y simular ataques en mi propio lab.
-4. Documentar qué alertas genera cada ataque y cómo se vería en un SOC.
+1. Sumar la VM de Kali y simular escaneos y ataques de fuerza bruta contra `win11-lab`. Con 16 GB de RAM no alcanzan las tres VM a la vez, así que tengo que resolver cómo repartir el lab.
+2. Probar más intentos de inicio de sesión fallidos para ver si se dispara una regla de correlación.
+3. Documentar cada ataque con su detección en Wazuh y su técnica MITRE.
 
 ---
 
-## 10. Lecciones aprendidas
+## 12. Lecciones aprendidas
 
 - **Medir en el momento del error, no después.** El `df` que mostraba espacio libre se había tomado tras la limpieza automática del instalador y llevó a descartar la causa real durante un buen rato.
 - **Registrar toda la salida de comandos largos** (`-v` y `tee`). Cuando un instalador se deshace solo, el mensaje que explica el fallo puede no estar en el log principal.
@@ -345,3 +450,8 @@ Después del reinicio apareció otro error en el log, `Authentication Exception`
 - **Cada componente usa su propio usuario.** El dashboard se conecta como `kibanaserver` y filebeat como `admin`. Cambiar la clave de uno no obliga a cambiar la del otro, y mezclarlas rompe el panel.
 - **Leer el mensaje de error completo antes de reintentar:** la herramienta de contraseñas decía exactamente qué símbolos aceptaba.
 - **Después de cambiar una contraseña, probar en una ventana de incógnito.** Una sesión vieja en el navegador puede dar errores de autenticación que parecen un problema del servidor.
+- **La ISO tiene que coincidir con la arquitectura del equipo.** Una imagen Arm64 no arranca en una PC Intel o AMD.
+- **Verificar que cada comando de la prueba terminó bien antes de interpretar las alertas.** El comando con el nombre de grupo en inglés falló con el error 1376, y los eventos de grupo de esa primera ronda venían de otra cosa.
+- **Los nombres de los grupos de Windows dependen del idioma del sistema.**
+- **Las técnicas MITRE que muestra Wazuh son una guía, no un veredicto:** conviene contrastarlas con lo que realmente se hizo.
+
