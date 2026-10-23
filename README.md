@@ -365,6 +365,8 @@ NET START Wazuh
 
 ## 10. Primera detección: actividad de prueba en Windows
 
+![Cinco intentos de inicio de sesión fallidos con runas](11-pruebas-runas.png)
+
 Para validar que el SIEM detecta actividad, generé eventos en mi propia VM con una PowerShell como administrador:
 
 ```powershell
